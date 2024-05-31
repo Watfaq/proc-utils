@@ -2,6 +2,8 @@
 name = "proc-utils"
 version = "0.1.0"
 edition = "2021"
+description = "Find process name of given socket source address and port"
+license-file = "LICENSE"
 
 [dependencies]
 
