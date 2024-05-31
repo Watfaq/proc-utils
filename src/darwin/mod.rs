@@ -1,84 +1,88 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+
+use std::{
+    ffi::CStr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ptr::null_mut,
+};
+
+use crate::Network;
 include!(concat!(env!("OUT_DIR"), "/darwin.rs"));
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        ptr::null_mut,
-    };
+pub fn find_process_by_socket(
+    src: Option<IpAddr>,
+    sport: Option<u16>,
+    network: Network,
+) -> Option<String> {
+    if src.is_none() && sport.is_none() {
+        return None;
+    }
 
-    use crate::darwin::{
-        proc_fdinfo, proc_listpids, proc_pidfdinfo, proc_pidinfo, proc_pidpath, socket_fdinfo,
-        AF_INET, AF_INET6, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS, PROC_PIDPATHINFO_MAXSIZE,
-        PROX_FDTYPE_SOCKET, SOCKINFO_IN, SOCKINFO_TCP,
-    };
+    let n = unsafe { proc_listpids(PROC_ALL_PIDS, 0, null_mut(), 0) };
 
-    use super::PROC_ALL_PIDS;
+    if n <= 0 {
+        return None;
+    }
 
-    #[test]
-    fn test_get_pid() {
-        let n = unsafe { proc_listpids(PROC_ALL_PIDS, 0, null_mut(), 0) };
+    let mut pids = vec![0; n as usize];
 
-        assert!(n > 0);
+    let n = unsafe { proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr() as _, n) };
 
-        let mut pids = vec![0; n as usize];
+    if n <= 0 {
+        return None;
+    }
 
-        let n = unsafe { proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr() as _, n) };
+    for pid in pids {
+        if pid == 0 {
+            continue;
+        }
 
-        assert!(n > 0);
+        let buf_size =
+            unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS as _, 0, null_mut(), 0) } as usize;
 
-        for pid in pids {
-            if pid == 0 {
+        let fd_size = std::mem::size_of::<proc_fdinfo>();
+
+        let mut fds: Vec<proc_fdinfo> = Vec::new();
+        fds.resize(buf_size / fd_size, unsafe { std::mem::zeroed() });
+
+        unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTFDS as _,
+                0,
+                fds.as_mut_ptr() as _,
+                buf_size as _,
+            )
+        };
+
+        for fd in fds {
+            if fd.proc_fd == 0 {
                 continue;
             }
 
-            let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
-            unsafe { proc_pidpath(pid, buf.as_mut_ptr() as _, PROC_PIDPATHINFO_MAXSIZE) };
-            let path = String::from_utf8(buf).unwrap();
+            if fd.proc_fdtype == PROX_FDTYPE_SOCKET {
+                let mut socket_info: socket_fdinfo = unsafe { std::mem::zeroed() };
+                let n = unsafe {
+                    proc_pidfdinfo(
+                        pid,
+                        fd.proc_fd as _,
+                        PROC_PIDFDSOCKETINFO as _,
+                        &mut socket_info as *mut _ as _,
+                        std::mem::size_of::<socket_fdinfo>() as _,
+                    )
+                };
 
-            let buf_size =
-                unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS as _, 0, null_mut(), 0) } as usize;
+                if std::mem::size_of::<socket_fdinfo>() == n as _
+                    && vec![AF_INET as i32, AF_INET6 as i32].contains(&socket_info.psi.soi_family)
+                {
+                    match network {
+                        Network::Tcp => {
+                            if socket_info.psi.soi_kind != SOCKINFO_TCP as _ {
+                                continue;
+                            }
 
-            let fd_size = std::mem::size_of::<proc_fdinfo>();
-
-            let mut fds: Vec<proc_fdinfo> = Vec::new();
-            fds.resize(buf_size / fd_size, unsafe { std::mem::zeroed() });
-
-            unsafe {
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS as _,
-                    0,
-                    fds.as_mut_ptr() as _,
-                    buf_size as _,
-                )
-            };
-
-            for fd in fds {
-                if fd.proc_fd == 0 {
-                    continue;
-                }
-
-                if fd.proc_fdtype == PROX_FDTYPE_SOCKET {
-                    let mut socket_info: socket_fdinfo = unsafe { std::mem::zeroed() };
-                    let n = unsafe {
-                        proc_pidfdinfo(
-                            pid,
-                            fd.proc_fd as _,
-                            PROC_PIDFDSOCKETINFO as _,
-                            &mut socket_info as *mut _ as _,
-                            std::mem::size_of::<socket_fdinfo>() as _,
-                        )
-                    };
-
-                    if std::mem::size_of::<socket_fdinfo>() == n as _
-                        && vec![AF_INET as i32, AF_INET6 as i32]
-                            .contains(&socket_info.psi.soi_family)
-                    {
-                        if socket_info.psi.soi_kind == SOCKINFO_TCP as _ {
                             let p =
                                 unsafe { socket_info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport };
 
@@ -116,11 +120,29 @@ mod tests {
                                     _ => unreachable!(),
                                 }
                             };
-                            println!(
-                                "local IP: {}, local_port TCP: {}, process: {}",
-                                local_ip, local_port, path
-                            );
-                        } else if socket_info.psi.soi_kind == SOCKINFO_IN as _ {
+
+                            if src.is_some() && src != Some(local_ip) {
+                                continue;
+                            }
+
+                            if sport.is_some() && sport != Some(local_port as _) {
+                                continue;
+                            }
+
+                            let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
+                            unsafe {
+                                proc_pidpath(pid, buf.as_mut_ptr() as _, PROC_PIDPATHINFO_MAXSIZE)
+                            };
+
+                            let path = CStr::from_bytes_until_nul(&buf)
+                                .unwrap()
+                                .to_owned()
+                                .to_string_lossy()
+                                .to_string();
+
+                            return Some(path);
+                        }
+                        Network::Udp => {
                             let p = unsafe { socket_info.psi.soi_proto.pri_in.insi_lport };
 
                             let mut local_port = 0;
@@ -154,14 +176,64 @@ mod tests {
                                     _ => unreachable!(),
                                 }
                             };
-                            println!(
-                                "local IP: {}, local_port UDP: {}, process: {}",
-                                local_ip, local_port, path
-                            );
+
+                            if src.is_some() && src != Some(local_ip) {
+                                continue;
+                            }
+
+                            if sport.is_some() && sport != Some(local_port as _) {
+                                continue;
+                            }
+
+                            let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE as usize];
+                            unsafe {
+                                proc_pidpath(pid, buf.as_mut_ptr() as _, PROC_PIDPATHINFO_MAXSIZE)
+                            };
+
+                            let path = CStr::from_bytes_until_nul(&buf)
+                                .unwrap()
+                                .to_owned()
+                                .to_string_lossy()
+                                .to_string();
+
+                            return Some(path);
                         }
                     }
                 }
             }
         }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    #[test]
+    fn test_get_find_tcp_socket() {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let path =
+            super::find_process_by_socket(Some(addr.ip()), Some(addr.port()), super::Network::Tcp);
+
+        assert!(path.is_some());
+
+        let current_exe = std::env::current_exe().unwrap();
+        assert_eq!(path.unwrap(), current_exe.to_str().unwrap());
+    }
+
+    #[test]
+    fn test_get_find_udp_socket() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let path =
+            super::find_process_by_socket(Some(addr.ip()), Some(addr.port()), super::Network::Udp);
+
+        assert!(path.is_some());
+
+        let current_exe = std::env::current_exe().unwrap();
+        assert_eq!(path.unwrap(), current_exe.to_str().unwrap());
     }
 }

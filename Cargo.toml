@@ -7,3 +7,10 @@ edition = "2021"
 
 [build-dependencies]
 bindgen = "0.65.1"
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[[bench]]
+name = "bench_find_process_by_socket"
+harness = false
